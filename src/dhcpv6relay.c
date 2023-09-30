@@ -118,7 +118,7 @@ int main(int argc, char ** argv)
 	while (true) {
 		socklen_t srclen = sizeof(src6);
 		struct dhcpv6_packet packet;
-		char ip6str[INET6_ADDRSTRLEN];
+
 		packet.pkt_size = recvfrom(sock_mcast, packet.raw, sizeof(packet.raw), 0,
 					(struct sockaddr*)&src6, &srclen);
 		if (packet.pkt_size < 0) {
@@ -127,24 +127,6 @@ int main(int argc, char ** argv)
 			continue;
 		}
 
-		printf("Received %ld bytes.\n", packet.pkt_size);
-		printf("SRC: [%s]:%u\n", inet_ntop(AF_INET6, &src6.sin6_addr, ip6str, sizeof(ip6str)),
-				ntohs(src6.sin6_port));
-
-		if (packet.pkt_size < 4) {
-			printf("short packet, need at least 4 bytes.");
-			continue;
-		}
-		printf("msg-type: %s(%d)\n", dhcpv6_type2string(packet.msg_type), packet.msg_type);
-		printf("trn-id: 0x%06X\n", packet.trn_id);
-
-		DHCPv6_FOREACH_PACKET_OPTION(&packet, opt) {
-			char *interp = (opt->meta && opt->meta->interp_to_string)
-				?  opt->meta->interp_to_string(opt->detail)
-				: NULL;
-			printf("option: %u/%s (len=%u)%s%s\n", ntohs(opt->detail->opcode), opt->meta ? opt->meta->opt_string : "unknown", ntohs(opt->detail->len), interp ? ": " : "", interp ?: "");
-
-			free(interp);
-		}
+		dhcpv6_dump_packet(stdout, &packet, &src6, DHCPv6_DIRECTION_RECEIVE, "ppp1/mc");
 	}
 }

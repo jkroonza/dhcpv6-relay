@@ -1,6 +1,7 @@
 #ifndef DHCPV6_H
 #define DHCPV6_H
 
+#include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <sys/types.h>
@@ -230,9 +231,15 @@ struct dhcpv6_duid {
 const char* dhcpv6_type2string(int msg_type);
 const struct dhcpv6_option_meta* dhcpv6_option_meta(uint16_t option);
 
-struct dhcpv6_packet_option* dhcpv6_packet_option_head(struct dhcpv6_packet*);
+struct dhcpv6_packet_option* dhcpv6_packet_option_head(const struct dhcpv6_packet*);
 struct dhcpv6_packet_option* dhcpv6_packet_option_next(struct dhcpv6_packet_option*);
 
 #define DHCPv6_FOREACH_PACKET_OPTION(p, x) for (struct dhcpv6_packet_option* x = dhcpv6_packet_option_head(p); x; x = dhcpv6_packet_option_next(x))
 
+#define DHCPv6_DIRECTION_RECEIVE	1
+#define DHCPv6_DIRECTION_TRANSMIT	2
+
+struct sockaddr_in6;
+
+void dhcpv6_dump_packet(FILE*, const struct dhcpv6_packet*, const struct sockaddr_in6*, int direction, const char* interface);
 #endif

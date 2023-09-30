@@ -43,7 +43,7 @@ const char* dhcpv6_type2string(int msg_type)
 	}
 }
 
-struct dhcpv6_packet_option* dhcpv6_packet_option_head(struct dhcpv6_packet* pkt)
+struct dhcpv6_packet_option* dhcpv6_packet_option_head(const struct dhcpv6_packet* pkt)
 {
 	if (pkt->pkt_size < 8) /* 32-bits header, option is min 32 bits */
 		return NULL;
@@ -243,5 +243,55 @@ const struct dhcpv6_option_meta* dhcpv6_option_meta(uint16_t option)
 		return &option_metas[option];
 
 	return NULL;
+
+}
+
+const char* dhcpv6_validate_packet(const struct dhcpv6_packet* packet)
+{
+	/* for now simply check that it's at least of length 4 */
+	if (packet->pkt_size < 4)
+		return "Short packet";
+
+	return NULL;
+}
+
+void dhcpv6_dump_packet(FILE* fp, const struct dhcpv6_packet* packet, const struct sockaddr_in6* remote, int direction, const char* interface)
+{
+	const char* dir = "(invalid direction)";
+	char ip6str[INET6_ADDRSTRLEN];
+	const char* invalid = dhcpv6_validate_packet(packet);
+
+	switch (direction) {
+	case DHCPv6_DIRECTION_RECEIVE:
+		dir = "Received";
+		break;
+	case DHCPv6_DIRECTION_TRANSMIT:
+		dir = "Transmit";
+		break;
+	}
+	fprintf(fp, "%s DHCPv6 packet of %ld bytes (interface=%s)\n", dir, packet->pkt_size, interface);
+
+	fprintf(fp, "Remote: [%s]:%u\n", inet_ntop(AF_INET6, &remote->sin6_addr, ip6str, sizeof(ip6str)),
+			ntohs(remote->sin6_port));
+
+	if (invalid)
+		fprintf(fp, "Packet is invalid: %s\n", invalid);
+
+	if (packet->pkt_size < 4)
+		return;
+
+	fprintf(fp, "msg-type: %s(%d)\n", dhcpv6_type2string(packet->msg_type), packet->msg_type);
+	fprintf(fp, "trn-id: 0x%06X\n", ntohl(packet->trn_id) >> 8);
+
+	DHCPv6_FOREACH_PACKET_OPTION(packet, opt) {
+		char *interp = (opt->meta && opt->meta->interp_to_string)
+			?  opt->meta->interp_to_string(opt->detail) : NULL;
+
+		fprintf(fp, "option: %u/%s (len=%u)%s%s\n", ntohs(opt->detail->opcode),
+				opt->meta ? opt->meta->opt_string : "unknown",
+				ntohs(opt->detail->len), interp ? ": " : "", interp ?: "");
+
+		free(interp);
+	}
 
 }
