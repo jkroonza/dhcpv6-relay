@@ -146,16 +146,16 @@ void iface_ll_handler(int /* epollfd */, struct if_uni_event *ev)
 	char ref[IFNAMSIZ+5];
 
 	socklen_t srclen = sizeof(src6);
+	sprintf(ref, "%s(ll)", iface->iface_name);
 
 	packet.pkt_size = recvfrom(ev->if_uni_fd, packet.raw, sizeof(packet.raw), 0,
 				(struct sockaddr*)&src6, &srclen);
 
 	if (packet.pkt_size < 0) {
-		perror("recvfrom(upstream)");
+		perror(ref);
 		return;
 	}
 
-	sprintf(ref, "%s(ll)", iface->iface_name);
 	dhcpv6_dump_packet(stdout, &packet, &src6, DHCPv6_DIRECTION_RECEIVE, ref);
 }
 
@@ -168,16 +168,16 @@ void iface_mc_handler(int /* epollfd */, struct if_mc_event *ev)
 	char ref[IFNAMSIZ+5];
 
 	socklen_t srclen = sizeof(src6);
+	sprintf(ref, "%s(mc)", iface->iface_name);
 
 	packet.pkt_size = recvfrom(ev->if_mc_fd, packet.raw, sizeof(packet.raw), 0,
 				(struct sockaddr*)&src6, &srclen);
 
 	if (packet.pkt_size < 0) {
-		perror("recvfrom(upstream)");
+		perror(ref);
 		return;
 	}
 
-	sprintf(ref, "%s(mc)", iface->iface_name);
 	dhcpv6_dump_packet(stdout, &packet, &src6, DHCPv6_DIRECTION_RECEIVE, ref);
 }
 
