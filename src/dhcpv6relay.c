@@ -9,124 +9,434 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/epoll.h>
+#include <getopt.h>
+#include <errno.h>
+#include <signal.h>
 
 #include "dhcpv6.h"
 
-int main(int argc, char ** argv)
+#define event_struct(pfx, ...) struct pfx##_event { int pfx##_fd; void (*pfx##_evhandler)(int epollfd, struct pfx##_event* ev); __VA_ARGS__ }
+event_struct(base);
+
+static
+void _event_destroy(int epollfd, struct base_event* ev)
 {
-	/*
-	struct addrinfo *ai = NULL;
-	struct addrinfo hints = {
-		.ai_family = AF_INET6,
-		.ai_socktype = SOCK_DGRAM,
-		.ai_protocol = 0,
-		.ai_flags = AI_PASSIVE,
-	};
-	int r = getaddrinfo("%ppp1", NULL, NULL, &ai);
-	if (r != 0) {
-		fprintf(stderr, "getaddrinfo failed: %s\n", gai_strerror(r));
-		return 1;
-	}
-	*/
+	epoll_ctl(epollfd, EPOLL_CTL_DEL, ev->base_fd, NULL);
+	free(ev);
+}
+#define event_destroy(epfd, x)	do { if (x) { _event_destroy(epfd, (struct base_event*)(x)); (x) = NULL; }} while(0)
+#define event_init(pfx, p, epollfd, fd, handler) ({ \
+		int r = -1; \
+		(p) = malloc(sizeof(*(p))); \
+		if ((p)) { \
+			struct epoll_event e = { \
+				.events = EPOLLIN | EPOLLRDHUP | EPOLLPRI | EPOLLERR | EPOLLHUP, \
+				.data.ptr = (void*)p, \
+			}; \
+			(p)->pfx##_fd = fd; \
+			(p)->pfx##_evhandler = (handler); \
+			r = epoll_ctl(epollfd, EPOLL_CTL_ADD, (fd), &e); \
+		} \
+		r; \
+	})
 
-	unsigned ifi = if_nametoindex("ppp1");
+/* helpers */
+int getservbyname_wrap(const char* name, struct servent *serv, char**buf)
+{
+	int r;
+	size_t buflen = 1024;
+	struct servent *tmp;
 
-	if (ifi == 0) {
-		perror("if_nametoindex");
-		return 1;
-	}
-
-	printf("interface index: %u\n", ifi);
-
-	struct ifaddrs *ifap_ = NULL;
-	int r = getifaddrs(&ifap_);
-	if (r < 0) {
-		perror("getifaddrs");
-		return 1;
-	}
-
-	struct sockaddr_in6* sa6;
-	struct ifaddrs *ifap;
-	for (ifap = ifap_; ifap; ifap = ifap->ifa_next) {
-		if (!ifap->ifa_addr || ifap->ifa_addr->sa_family != AF_INET6)
-			continue;
-
-		sa6 = (struct sockaddr_in6*)ifap->ifa_addr;
-		if (sa6->sin6_scope_id != ifi)
-			continue;
-
-		char ip6str[INET6_ADDRSTRLEN];
-		if (!inet_ntop(AF_INET6, &sa6->sin6_addr, ip6str, sizeof(ip6str))) {
-			perror("inet_ntop");
-			return 1;
+	*buf = malloc(buflen);
+	while (0 != (r = getservbyname_r(name, "udp", serv, *buf, buflen, &tmp))) {
+		if (r == ERANGE) {
+			char *t = realloc(*buf, buflen *= 2);
+			if (!t) {
+				free(*buf);
+				*buf = NULL;
+				errno = ENOMEM;
+				return -1;
+			}
+		} else {
+			errno = r;
+			return -1;
 		}
-		printf("%s/%x/%s\n", ifap->ifa_name, ifap->ifa_flags, ip6str);
-		break;
 	}
 
-	if (!ifap) {
-		fprintf(stderr, "Unable to locate interface LL address.");
-		return 1;
+	return r;
+}
+
+bool in_null_term_array(const char* needle, char ** haystack)
+{
+	while (*haystack) {
+		if (strcmp(*haystack++, needle) == 0)
+			return true;
+	}
+	return false;
+}
+
+/* signal handlers */
+static volatile bool running = true;
+
+void sig_terminate(int)
+{
+	running = false;
+}
+
+/* argument handling */
+static
+struct option options[] = {
+	{ "upstream",	required_argument,	NULL, 'u' },
+	{ "help",		no_argument,		NULL, 'h' },
+	{ NULL, 0, NULL, 0 }
+};
+
+static
+int usage(const char* progname, FILE* o, int r)
+{
+	fprintf(o, "USAGE: %s [options] -- interface ...\n"
+			"  --upstream|-u ipv6addr\n"
+			"    IPv6 address to which to relay, currently no port specification is possible.\n"
+			"  --help|-h\n"
+			"    This help text, and exit.\n", progname);
+	return r;
+}
+
+
+/* Interface handlers */
+struct iface;
+
+event_struct(if_uni, struct iface* iface;);
+event_struct(if_mc, struct iface* iface;);
+
+struct iface {
+	struct if_uni_event *uni;
+	struct if_mc_event *mc;
+	char* iface_name;
+
+	struct iface *next;
+};
+
+static struct iface *iface_head = NULL;
+
+static
+struct iface *iface_get(const char* name)
+{
+	struct iface *t = iface_head;
+	while (t && strcmp(name, t->iface_name) != 0)
+		t = t->next;
+
+	return t;
+}
+
+static
+void iface_unbind(int epollfd, struct iface* iface)
+{
+	event_destroy(epollfd, iface->uni);
+	event_destroy(epollfd, iface->mc);
+}
+
+static
+void iface_ll_handler(int /* epollfd */, struct if_uni_event *ev)
+{
+	struct dhcpv6_packet packet;
+	struct sockaddr_in6 src6;
+	struct iface* iface = ev->iface;
+	char ref[IFNAMSIZ+5];
+
+	socklen_t srclen = sizeof(src6);
+
+	packet.pkt_size = recvfrom(ev->if_uni_fd, packet.raw, sizeof(packet.raw), 0,
+				(struct sockaddr*)&src6, &srclen);
+
+	if (packet.pkt_size < 0) {
+		perror("recvfrom(upstream)");
+		return;
 	}
 
-	int sock_linklocal = socket(AF_INET6, SOCK_DGRAM, 0);
-	if (sock_linklocal < 0) {
-		perror("socket");
-		return 1;
+	sprintf(ref, "%s(ll)", iface->iface_name);
+	dhcpv6_dump_packet(stdout, &packet, &src6, DHCPv6_DIRECTION_RECEIVE, ref);
+}
+
+static
+void iface_mc_handler(int /* epollfd */, struct if_mc_event *ev)
+{
+	struct dhcpv6_packet packet;
+	struct sockaddr_in6 src6;
+	struct iface* iface = ev->iface;
+	char ref[IFNAMSIZ+5];
+
+	socklen_t srclen = sizeof(src6);
+
+	packet.pkt_size = recvfrom(ev->if_mc_fd, packet.raw, sizeof(packet.raw), 0,
+				(struct sockaddr*)&src6, &srclen);
+
+	if (packet.pkt_size < 0) {
+		perror("recvfrom(upstream)");
+		return;
 	}
 
-	sa6->sin6_port = htons(547);
+	sprintf(ref, "%s(mc)", iface->iface_name);
+	dhcpv6_dump_packet(stdout, &packet, &src6, DHCPv6_DIRECTION_RECEIVE, ref);
+}
 
-	if (bind(sock_linklocal, ifap->ifa_addr, sizeof(*sa6)) < 0) {
-		perror("bind");
-		return 1;
-	}
-
+static
+int _iface_bind(struct iface* iface, int epollfd, const struct sockaddr_in6 *ll)
+{
+	int sock_linklocal = socket(AF_INET6, SOCK_DGRAM, 0), sock_mcast = -1;
 	struct ipv6_mreq mreq;
+	struct sockaddr_in6 mc6a;
+
+	if (sock_linklocal < 0)
+		goto errout;
+
+	if (bind(sock_linklocal, (const struct sockaddr*)ll, sizeof(*ll)) < 0)
+		goto errout;
+
 	memset(&mreq, 0, sizeof(mreq));
+	if (inet_pton(AF_INET6, "ff02::1:2", &mreq.ipv6mr_multiaddr) < 0)
+		goto errout;
+	mreq.ipv6mr_interface = ll->sin6_scope_id;
 
-	if (inet_pton(AF_INET6, "ff02::1:2", &mreq.ipv6mr_multiaddr) < 0) {
-		perror("inet_pton(ff02::1:2)");
-		return 1;
-	}
-	mreq.ipv6mr_interface = ifi;
+	if (setsockopt(sock_linklocal, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mreq, sizeof(mreq)) < 0)
+		goto errout;
 
-	r = setsockopt(sock_linklocal, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mreq, sizeof(mreq));
-	if (r < 0) {
-		perror("setsockopt(IPV6_JOIN_GROUP)");
-		return 1;
-	}
-
-	int sock_mcast = socket(AF_INET6, SOCK_DGRAM, 0);
+	sock_mcast = socket(AF_INET6, SOCK_DGRAM, 0);
 	if (sock_mcast < 0) {
 		perror("socket(mcast)");
 		return 1;
 	}
 
-	struct sockaddr_in6 src6;
-	memset(&src6, 0, sizeof(src6));
-	src6.sin6_family = AF_INET6;
-	src6.sin6_port = htons(547);
-	src6.sin6_addr = mreq.ipv6mr_multiaddr;
-	src6.sin6_scope_id = ifi;
+	memset(&mc6a, 0, sizeof(mc6a));
+	mc6a.sin6_family = AF_INET6;
+	mc6a.sin6_port = ll->sin6_port;
+	mc6a.sin6_addr = mreq.ipv6mr_multiaddr;
+	mc6a.sin6_scope_id = ll->sin6_scope_id;
 
-	if (bind(sock_mcast, (struct sockaddr *)&src6, sizeof(src6)) < 0) {
-		perror("bind(mcast)");
+	if (bind(sock_mcast, (struct sockaddr *)&mc6a, sizeof(mc6a)) < 0)
+		goto errout;
+
+	if (event_init(if_uni, iface->uni, epollfd, sock_linklocal, iface_ll_handler) < 0)
+		goto errout;
+
+	if (event_init(if_mc, iface->mc, epollfd, sock_mcast, iface_mc_handler) < 0)
+		goto errout;
+
+	return 0;
+errout:
+	int terrno = errno;
+	if (sock_linklocal >= 0)
+		close(sock_linklocal);
+	if (sock_mcast >= 0)
+		close(sock_mcast);
+	errno = terrno;
+	return -1;
+}
+
+static
+struct iface* iface_create(const char* name)
+{
+	struct iface *t = malloc(sizeof(*t));
+	if (!t)
+		return t;
+
+	memset(t, 0, sizeof(*t));
+
+	t->iface_name = strdup(name);
+	if (!t->iface_name) {
+		free(t);
+		return NULL;
+	}
+
+	return t;
+}
+
+static
+void iface_free(int epollfd, struct iface* iface)
+{
+	iface_unbind(epollfd, iface);
+	free(iface->iface_name);
+	free(iface);
+}
+
+static
+struct iface *iface_bind(int epollfd, const char* name, const struct sockaddr_in6 *ll)
+{
+	struct iface* iface = iface_get(name);
+	if (iface)
+		iface_unbind(epollfd, iface);
+	else if (!(iface = iface_create(name)))
+		return NULL;
+
+	if (_iface_bind(iface, epollfd, ll) < 0) {
+		iface_free(epollfd, iface);
+		return NULL;
+	}
+	return iface;
+}
+
+/* upstream handler */
+event_struct(upstream, char* remotename; struct sockaddr_in6 remote; uint16_t port;);
+
+static
+void upstream_handler(int /* epollfd */, struct upstream_event* ev)
+{
+	struct dhcpv6_packet packet;
+	struct sockaddr_in6 src6;
+	socklen_t srclen = sizeof(src6);
+
+	packet.pkt_size = recvfrom(ev->upstream_fd, packet.raw, sizeof(packet.raw), 0,
+				(struct sockaddr*)&src6, &srclen);
+
+	if (packet.pkt_size < 0) {
+		perror("recvfrom(upstream)");
+		return;
+	}
+
+	dhcpv6_dump_packet(stdout, &packet, &src6, DHCPv6_DIRECTION_RECEIVE, "upstream");
+}
+
+static
+struct upstream_event upstream = {
+	.upstream_fd = -1,
+	.upstream_evhandler = upstream_handler,
+	.remotename = NULL,
+	.port = 547,
+};
+
+/* what can we say ... main */
+int main(int argc, char ** argv)
+{
+	int c, epollfd, r;
+	struct sockaddr_in6 sockad;
+	socklen_t socklen;
+	struct servent serv_client, serv_server;
+	char *buf_client, *buf_server;
+	char ip6addr[INET6_ADDRSTRLEN];
+	struct ifaddrs *ifap_;
+	struct sigaction sa;
+	sigset_t sigmask, waitmask;
+
+	if (getservbyname_wrap("dhcpv6-client", &serv_client, &buf_client)) {
+		perror("error getting service entry for dhcpv6-client");
+		return 1;
+	}
+	if (getservbyname_wrap("dhcpv6-server", &serv_server, &buf_server)) {
+		perror("error getting service entry for dhcpv6-server");
 		return 1;
 	}
 
-	while (true) {
-		socklen_t srclen = sizeof(src6);
-		struct dhcpv6_packet packet;
+	while ((c = getopt_long(argc, argv, "u:h", options, NULL)) != -1) {
+		switch (c) {
+		case 0:
+			break;
+		case 'h':
+			return usage(*argv, stdout, 0);
+		default:
+		}
+	}
 
-		packet.pkt_size = recvfrom(sock_mcast, packet.raw, sizeof(packet.raw), 0,
-					(struct sockaddr*)&src6, &srclen);
-		if (packet.pkt_size < 0) {
-			perror("recvfrom");
-			usleep(50);
+	epollfd = epoll_create1(EPOLL_CLOEXEC);
+
+	if (epollfd < 0) {
+		perror("epoll_create1");
+		return 1;
+	}
+
+	upstream.upstream_fd = socket(AF_INET6, SOCK_DGRAM, 0);
+	if (upstream.upstream_fd < 0) {
+		perror("Error creating upstream socket");
+		return 1;
+	}
+
+	if (setsockopt(upstream.upstream_fd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int)) < 0)
+		perror("error setting SO_REUSEADDR on upstream socket");
+
+	memset(&sockad, 0, sizeof(sockad));
+	socklen = sizeof(sockad);
+	sockad.sin6_family = AF_INET6;
+	sockad.sin6_port = serv_client.s_port;
+	upstream.port = serv_server.s_port;
+
+	if (bind(upstream.upstream_fd, (struct sockaddr*)&sockad, socklen) < 0)
+		perror("Error binding upstream socket to port, using ephemeral");
+
+	r = getifaddrs(&ifap_);
+	if (r < 0) {
+		perror("getifaddrs");
+		return 1;
+	}
+
+	for (char** tmp = &argv[optind]; *tmp; ++tmp)
+		printf("Permissable interface: %s\n", *tmp);
+
+	struct sockaddr_in6* sa6;
+	struct ifaddrs *ifap;
+	for (ifap = ifap_; ifap; ifap = ifap->ifa_next) {
+		/* only care about IPv6. */
+		if (!ifap->ifa_addr || ifap->ifa_addr->sa_family != AF_INET6)
 			continue;
+
+		sa6 = (struct sockaddr_in6*)ifap->ifa_addr;
+
+		if (!sa6->sin6_scope_id)
+			continue; /* global or non-link addresses */
+
+		if (!in_null_term_array(ifap->ifa_name, &argv[optind]))
+			continue;
+
+		if (!inet_ntop(AF_INET6, &sa6->sin6_addr, ip6addr, sizeof(ip6addr))) {
+			perror("inet_ntop");
+			return 1;
 		}
 
-		dhcpv6_dump_packet(stdout, &packet, &src6, DHCPv6_DIRECTION_RECEIVE, "ppp1/mc");
+		printf("Found %s on %s (scope=%d)\n", ip6addr, ifap->ifa_name, sa6->sin6_scope_id);
+
+		sa6->sin6_port = serv_server.s_port;
+		if (!iface_bind(epollfd, ifap->ifa_name, sa6)) {
+			perror(ifap->ifa_name);
+		}
 	}
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = sig_terminate;
+	if (sigaction(SIGTERM, &sa, NULL) < 0)
+		perror("Signal handler: SIGTERM");
+	if (sigaction(SIGINT, &sa, NULL) < 0)
+		perror("Signal handler: SIGINT");
+
+	if (sigprocmask(0, NULL, &waitmask) < 0) {
+		perror("obtainig default blocked signal set");
+		sigemptyset(&waitmask);
+	}
+
+	if (sigemptyset(&sigmask) < 0 ||
+			sigaddset(&sigmask, SIGINT) < 0 ||
+			sigaddset(&sigmask, SIGTERM) < 0)
+		perror("Setting up signal mask set");
+
+	if (sigprocmask(SIG_BLOCK, &sigmask, NULL) < 0)
+		perror("blocking SIGINT+SIGTERM");
+
+	while (running) {
+		struct epoll_event events[10];
+		r = epoll_pwait(epollfd, events, 10, -1, &waitmask);
+
+		if (sigprocmask(SIG_UNBLOCK, &sigmask, NULL) < 0)
+			perror("unblocking SIGINT+SIGTERM");
+
+		if (r < 0) {
+			if (errno != EAGAIN && errno != EINTR)
+				perror("epoll_wait");
+		} else {
+		}
+
+		if (sigprocmask(SIG_BLOCK, &sigmask, NULL) < 0)
+			perror("blocking SIGINT+SIGTERM");
+	}
+
+	printf("Terminating.\n");
+
+	return 0;
 }
