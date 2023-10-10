@@ -87,6 +87,7 @@ void sig_terminate(int)
 /* argument handling */
 static
 struct option options[] = {
+	{ "bind",		required_argument,	NULL, 'b' },
 	{ "upstream",	required_argument,	NULL, 'u' },
 	{ "help",		no_argument,		NULL, 'h' },
 	{ NULL, 0, NULL, 0 }
@@ -102,6 +103,10 @@ int usage(const char* progname, FILE* o, int r)
 			"    don't want to specify a port, just append a trailing :, eg, instead of ::1 use ::1:\n"
 			"    this way the last colon is used as the host:port separator, but due to being an empty\n"
 			"    string will be defaulted to dhcpv6-server.\n"
+			"  --bind|-b ipv6addr\n"
+			"    In some cases you may want to bind the upstream socket to a specific local address.\n"
+			"    Normally we will bind to localhost:dhcpv6-server and then 'narrow' to a specific local\n"
+			"    address based on upstream.  If upstream is on the local host that could cause issues.\n"
 			"  --help|-h\n"
 			"    This help text, and exit.\n", progname);
 	return r;
@@ -327,6 +332,11 @@ void upstream_handler(int /* epollfd */, struct upstream_event* ev)
 	}
 
 	dhcpv6_dump_packet(stdout, &packet, &src6, DHCPv6_DIRECTION_RECEIVE, "upstream");
+
+	if (!dhcpv6_packet_valid(&packet) || packet.msg_type != htons(DHCPv6_MSGTYPE_RELAY_REPL))
+		return;
+
+	printf("Intend to relay from upstream to client (or another relay)\n");
 }
 
 static
@@ -352,28 +362,30 @@ int main(int argc, char ** argv)
 	int c, epollfd, r;
 	struct sockaddr_in6 sockad;
 	socklen_t socklen;
-	struct servent serv_client, serv_server;
-	char *buf_client, *buf_server;
+	struct servent serv_server;
+	char *buf_server;
 	char ip6addr[INET6_ADDRSTRLEN];
 	struct ifaddrs *ifap_;
 	struct sigaction sa;
 	sigset_t sigmask, waitmask;
 
-	if (getservbyname_wrap("dhcpv6-client", &serv_client, &buf_client)) {
-		perror("error getting service entry for dhcpv6-client");
-		return 1;
-	}
 	if (getservbyname_wrap("dhcpv6-server", &serv_server, &buf_server)) {
 		perror("error getting service entry for dhcpv6-server");
 		return 1;
 	}
 
-	while ((c = getopt_long(argc, argv, "u:h", options, NULL)) != -1) {
+	memset(&sockad, 0, sizeof(sockad));
+	socklen = sizeof(sockad);
+	sockad.sin6_family = AF_INET6;
+	sockad.sin6_port = serv_server.s_port;
+
+	while ((c = getopt_long(argc, argv, "b:u:h", options, NULL)) != -1) {
 		switch (c) {
 		case 0:
 			break;
 		case 'h':
 			return usage(*argv, stdout, 0);
+		case 'b':
 		case 'u':
 			{
 				char *host = optarg;
@@ -401,16 +413,26 @@ int main(int argc, char ** argv)
 					return 1;
 				}
 
-				memcpy(&upstream.remote, res->ai_addr, res->ai_addrlen);
+				switch (c) {
+				case 'u':
+					memcpy(&upstream.remote, res->ai_addr, res->ai_addrlen);
+					if (service)
+						*--service = ':';
+					else
+						upstream.remote.sin6_port = serv_server.s_port;
+					upstream.remotename = optarg;
+					break;
+				case 'b':
+					memcpy(&sockad, res->ai_addr, res->ai_addrlen);
+					if (!service)
+						sockad.sin6_port = serv_server.s_port;
+					break;
+				default:
+					fprintf(stderr, "Code bug for option '%c', please file a bug.\n", c);
+					return 1;
+				}
 
 				freeaddrinfo(res);
-
-				if (service)
-					*--service = ':';
-				else
-					upstream.remote.sin6_port = serv_server.s_port;
-
-				upstream.remotename = optarg;
 			}
 			break;
 		default:
@@ -438,15 +460,10 @@ int main(int argc, char ** argv)
 	if (setsockopt(upstream.upstream_fd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int)) < 0)
 		perror("error setting SO_REUSEADDR on upstream socket");
 
-	memset(&sockad, 0, sizeof(sockad));
-	socklen = sizeof(sockad);
-	sockad.sin6_family = AF_INET6;
-	sockad.sin6_port = serv_client.s_port;
-
 	if (bind(upstream.upstream_fd, (struct sockaddr*)&sockad, socklen) < 0)
 		perror("Error binding upstream socket to port, using ephemeral");
 
-	if (connect(upstream.upstream_fd, (struct sockaddr*)&upstream.remote, sizeof(upstream.remote)) < 0)
+	if (memcmp(&sockad.sin6_addr, &in6addr_any, sizeof(in6addr_any)) == 0 && connect(upstream.upstream_fd, (struct sockaddr*)&upstream.remote, sizeof(upstream.remote)) < 0)
 		perror("Error narrowing client socket");
 
 	r = getifaddrs(&ifap_);
