@@ -284,6 +284,8 @@ const struct dhcpv6_option_meta* dhcpv6_option_meta(uint16_t option);
 /* -1 error (errno), 0 success */
 int dhcpv6_append_option(struct dhcpv6_packet* pkt, uint16_t opcode, void* payload, uint16_t payloadlen);
 
+const struct dhcpv6_option* dhcpv6_packet_get_option(const struct dhcpv6_packet* pkt, uint16_t opcode);
+
 struct dhcpv6_packet_option* dhcpv6_packet_option_head(const struct dhcpv6_packet*);
 struct dhcpv6_packet_option* dhcpv6_packet_option_next(struct dhcpv6_packet_option*);
 

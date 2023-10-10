@@ -387,3 +387,17 @@ int dhcpv6_append_option(struct dhcpv6_packet* pkt, uint16_t opcode, void* paylo
 
 	return 0;
 }
+
+const struct dhcpv6_option* dhcpv6_packet_get_option(const struct dhcpv6_packet* packet, uint16_t opcode)
+{
+	opcode = htons(opcode);
+	DHCPv6_FOREACH_PACKET_OPTION(packet, opt) {
+		if (opt->detail->opcode == opcode) {
+			const struct dhcpv6_option* t = opt->detail;
+			free(opt);
+			return t;
+		}
+	}
+
+	return NULL;
+}
