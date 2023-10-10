@@ -103,18 +103,21 @@ int usage(const char* progname, FILE* o, int r)
 	return r;
 }
 
-
 /* Interface handlers */
 struct iface;
 
 event_struct(if_uni, struct iface* iface;);
 event_struct(if_mc, struct iface* iface;);
 
+/* forward to relay upstream */
+static void relay_upstream(const struct dhcpv6_packet *);
+
 struct iface {
 	struct if_uni_event *uni;
 	struct if_mc_event *mc;
 	char* iface_name;
-
+	struct in6_addr lla;
+	uint32_t linkid;
 	struct iface *next;
 };
 
@@ -138,47 +141,66 @@ void iface_unbind(int epollfd, struct iface* iface)
 }
 
 static
-void iface_ll_handler(int /* epollfd */, struct if_uni_event *ev)
+void iface_common_handler(int /* epollfd */, int rdfd, const char* ref, struct iface* iface)
 {
 	struct dhcpv6_packet packet;
+	struct dhcpv6_packet relay;
 	struct sockaddr_in6 src6;
-	struct iface* iface = ev->iface;
-	char ref[IFNAMSIZ+5];
 
 	socklen_t srclen = sizeof(src6);
-	sprintf(ref, "%s(ll)", iface->iface_name);
 
-	packet.pkt_size = recvfrom(ev->if_uni_fd, packet.raw, sizeof(packet.raw), 0,
+	packet.pkt_size = recvfrom(rdfd, packet.raw, sizeof(packet.raw), 0,
 				(struct sockaddr*)&src6, &srclen);
 
-	if (packet.pkt_size < 0) {
+	if (packet.pkt_size == (size_t)-1) {
 		perror(ref);
 		return;
 	}
 
 	dhcpv6_dump_packet(stdout, &packet, &src6, DHCPv6_DIRECTION_RECEIVE, ref);
+
+	if (!dhcpv6_packet_valid(&packet))
+		return; /* discard invalid packets */
+
+	relay.msg_type = DHCPv6_MSGTYPE_RELAY_FORW;
+	if (packet.msg_type == DHCPv6_MSGTYPE_RELAY_FORW) {
+		relay.relay.hop_count = packet.relay.hop_count+1;
+	} else {
+		relay.relay.hop_count = 0;
+	}
+
+	/* here we should technically inject a GUA/LUA, but in our
+	 * expected use-case (ppp) we will usually only have a LL
+	 * address, if this changes, this will need adjustment */
+	relay.relay.link_address = iface->lla;
+	relay.relay.peer_address = src6.sin6_addr;
+
+	relay.pkt_size = dhcpv6_min_packet_size(&relay);
+
+	dhcpv6_append_option(&relay, DHCPv6_OPTION_INTERFACE_ID, &iface->linkid, sizeof(iface->linkid));
+//	dhcpv6_append_option(&relay, DHCPv6_OPTION_, packet->raw, packet->pkt_size);
+
+	relay_upstream(&relay);
 }
 
 static
-void iface_mc_handler(int /* epollfd */, struct if_mc_event *ev)
+void iface_ll_handler(int epollfd, struct if_uni_event *ev)
 {
-	struct dhcpv6_packet packet;
-	struct sockaddr_in6 src6;
 	struct iface* iface = ev->iface;
 	char ref[IFNAMSIZ+5];
 
-	socklen_t srclen = sizeof(src6);
+	sprintf(ref, "%s(ll)", iface->iface_name);
+	iface_common_handler(epollfd, ev->if_uni_fd, ref, iface);
+}
+
+static
+void iface_mc_handler(int epollfd, struct if_mc_event *ev)
+{
+	struct iface* iface = ev->iface;
+	char ref[IFNAMSIZ+5];
+
 	sprintf(ref, "%s(mc)", iface->iface_name);
-
-	packet.pkt_size = recvfrom(ev->if_mc_fd, packet.raw, sizeof(packet.raw), 0,
-				(struct sockaddr*)&src6, &srclen);
-
-	if (packet.pkt_size < 0) {
-		perror(ref);
-		return;
-	}
-
-	dhcpv6_dump_packet(stdout, &packet, &src6, DHCPv6_DIRECTION_RECEIVE, ref);
+	iface_common_handler(epollfd, ev->if_mc_fd, ref, iface);
 }
 
 static
@@ -222,6 +244,9 @@ int _iface_bind(struct iface* iface, int epollfd, const struct sockaddr_in6 *ll)
 
 	if (event_init(if_mc, iface->mc, epollfd, sock_mcast, iface_mc_handler) < 0)
 		goto errout;
+
+	iface->uni->iface = iface;
+	iface->mc->iface = iface;
 
 	return 0;
 errout:
@@ -269,6 +294,9 @@ struct iface *iface_bind(int epollfd, const char* name, const struct sockaddr_in
 	else if (!(iface = iface_create(name)))
 		return NULL;
 
+	iface->lla = ll->sin6_addr;
+	iface->linkid = ll->sin6_scope_id;
+
 	if (_iface_bind(iface, epollfd, ll) < 0) {
 		iface_free(epollfd, iface);
 		return NULL;
@@ -277,7 +305,7 @@ struct iface *iface_bind(int epollfd, const char* name, const struct sockaddr_in
 }
 
 /* upstream handler */
-event_struct(upstream, char* remotename; struct sockaddr_in6 remote; uint16_t port;);
+event_struct(upstream, char* remotename; struct sockaddr_in6 remote;);
 
 static
 void upstream_handler(int /* epollfd */, struct upstream_event* ev)
@@ -289,7 +317,7 @@ void upstream_handler(int /* epollfd */, struct upstream_event* ev)
 	packet.pkt_size = recvfrom(ev->upstream_fd, packet.raw, sizeof(packet.raw), 0,
 				(struct sockaddr*)&src6, &srclen);
 
-	if (packet.pkt_size < 0) {
+	if (packet.pkt_size == (size_t)-1) {
 		perror("recvfrom(upstream)");
 		return;
 	}
@@ -301,9 +329,16 @@ static
 struct upstream_event upstream = {
 	.upstream_fd = -1,
 	.upstream_evhandler = upstream_handler,
-	.remotename = NULL,
-	.port = 547,
+	.remotename = 0,
 };
+
+static
+void relay_upstream(const struct dhcpv6_packet *pkt)
+{
+	if (sendto(upstream.upstream_fd, pkt->raw, pkt->pkt_size, MSG_DONTWAIT,
+			(struct sockaddr*)&upstream.remote, sizeof(upstream.remote)) < 0)
+		perror("send to upstream");
+}
 
 /* what can we say ... main */
 int main(int argc, char ** argv)
@@ -357,7 +392,6 @@ int main(int argc, char ** argv)
 	socklen = sizeof(sockad);
 	sockad.sin6_family = AF_INET6;
 	sockad.sin6_port = serv_client.s_port;
-	upstream.port = serv_server.s_port;
 
 	if (bind(upstream.upstream_fd, (struct sockaddr*)&sockad, socklen) < 0)
 		perror("Error binding upstream socket to port, using ephemeral");
@@ -430,6 +464,11 @@ int main(int argc, char ** argv)
 			if (errno != EAGAIN && errno != EINTR)
 				perror("epoll_wait");
 		} else {
+			printf("%d sockets are ready.\n", r);
+			for (c = 0; c < r; ++c) {
+				struct base_event* ev = events[c].data.ptr;
+				ev->base_evhandler(epollfd, ev);
+			}
 		}
 
 		if (sigprocmask(SIG_BLOCK, &sigmask, NULL) < 0)

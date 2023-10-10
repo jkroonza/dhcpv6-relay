@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <sys/types.h>
+#include <arpa/inet.h>
 
 #define DHCPv6_MSGTYPE_SOLICIT              1
 #define DHCPv6_MSGTYPE_ADVERTISE            2
@@ -180,17 +181,65 @@ struct dhcpv6_option {
 	unsigned char payload[0];
 } __attribute__((packed));
 
+/* a compile failure here indicates that in6_addr isn't 16 bytes) */
+typedef char __ct_test[(sizeof(struct in6_addr) == 16) - 1];
+
 struct dhcpv6_packet {
-	ssize_t pkt_size;
+	size_t pkt_size;
 	union {
-		unsigned char raw[0x10000];
+		unsigned char raw[0xffff];
 		struct {
 			uint8_t msg_type;
-			unsigned trn_id:24;
-			struct dhcpv6_option optdata[0];
+			union {
+				struct {
+					unsigned trn_id:24;
+					struct dhcpv6_option optdata[0];
+				} norm;
+				struct {
+					uint8_t hop_count;
+					struct in6_addr link_address;
+					struct in6_addr peer_address;
+					struct dhcpv6_option optdata[0];
+				} relay;
+			};
 		};
 	};
 } __attribute__((packed));
+
+static
+inline bool dhcpv6_packet_is_relay(const struct dhcpv6_packet *pkt)
+{
+	return pkt->msg_type == DHCPv6_MSGTYPE_RELAY_FORW ||
+		pkt->msg_type == DHCPv6_MSGTYPE_RELAY_REPL;
+}
+
+/* this assumes that dhcp_packet_valid has passed at least basic checks */
+static
+inline size_t dhcpv6_min_packet_size(const struct dhcpv6_packet *pkt)
+{
+	if (dhcpv6_packet_is_relay(pkt))
+		return sizeof(pkt->relay) + sizeof(pkt->msg_type);
+	return sizeof(pkt->norm) + sizeof(pkt->msg_type);
+}
+
+const char* dhcpv6_packet_valid_reason(const struct dhcpv6_packet* packet);
+
+/* do not invoke this directly */
+bool _dhcpv6_packet_valid(const struct dhcpv6_packet *pkt);
+
+static
+inline bool dhcpv6_packet_valid(const struct dhcpv6_packet *pkt)
+{
+	/* we perform basic checks here prior to going off and validating the full
+	 * packet */
+	if (pkt->pkt_size == 0 || pkt->pkt_size > sizeof(pkt->raw))
+		return false;
+
+	if (pkt->pkt_size < dhcpv6_min_packet_size(pkt))
+		return false;
+
+	return _dhcpv6_packet_valid(pkt);
+}
 
 struct dhcpv6_option_meta {
 	const char* opt_string;
@@ -231,6 +280,9 @@ struct dhcpv6_duid {
 const char* dhcpv6_type2string(int msg_type);
 const struct dhcpv6_option_meta* dhcpv6_option_meta(uint16_t option);
 
+/* -1 error (errno), 0 success */
+int dhcpv6_append_option(struct dhcpv6_packet* pkt, uint16_t opcode, void* payload, uint16_t payloadlen);
+
 struct dhcpv6_packet_option* dhcpv6_packet_option_head(const struct dhcpv6_packet*);
 struct dhcpv6_packet_option* dhcpv6_packet_option_next(struct dhcpv6_packet_option*);
 
@@ -238,8 +290,6 @@ struct dhcpv6_packet_option* dhcpv6_packet_option_next(struct dhcpv6_packet_opti
 
 #define DHCPv6_DIRECTION_RECEIVE	1
 #define DHCPv6_DIRECTION_TRANSMIT	2
-
-struct sockaddr_in6;
 
 void dhcpv6_dump_packet(FILE*, const struct dhcpv6_packet*, const struct sockaddr_in6*, int direction, const char* interface);
 #endif
