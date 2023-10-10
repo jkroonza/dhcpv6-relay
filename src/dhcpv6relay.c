@@ -26,17 +26,20 @@ void _event_destroy(int epollfd, struct base_event* ev)
 	free(ev);
 }
 #define event_destroy(epfd, x)	do { if (x) { _event_destroy(epfd, (struct base_event*)(x)); (x) = NULL; }} while(0)
+#define event_activate(pfx, epollfd, p) ({ \
+		struct epoll_event e = { \
+			.events = EPOLLIN | EPOLLRDHUP | EPOLLPRI | EPOLLERR | EPOLLHUP, \
+			.data.ptr = (void*)p, \
+		}; \
+		epoll_ctl(epollfd, EPOLL_CTL_ADD, (p)->pfx##_fd, &e); \
+	})
 #define event_init(pfx, p, epollfd, fd, handler) ({ \
 		int r = -1; \
 		(p) = malloc(sizeof(*(p))); \
 		if ((p)) { \
-			struct epoll_event e = { \
-				.events = EPOLLIN | EPOLLRDHUP | EPOLLPRI | EPOLLERR | EPOLLHUP, \
-				.data.ptr = (void*)p, \
-			}; \
 			(p)->pfx##_fd = fd; \
 			(p)->pfx##_evhandler = (handler); \
-			r = epoll_ctl(epollfd, EPOLL_CTL_ADD, (fd), &e); \
+			r = event_activate(pfx, (epollfd), (p)); \
 		} \
 		r; \
 	})
@@ -465,6 +468,11 @@ int main(int argc, char ** argv)
 
 	if (memcmp(&sockad.sin6_addr, &in6addr_any, sizeof(in6addr_any)) == 0 && connect(upstream.upstream_fd, (struct sockaddr*)&upstream.remote, sizeof(upstream.remote)) < 0)
 		perror("Error narrowing client socket");
+
+	if (event_activate(upstream, epollfd, &upstream) < 0) {
+		perror("epoll(upstream)");
+		return 1;
+	}
 
 	r = getifaddrs(&ifap_);
 	if (r < 0) {
