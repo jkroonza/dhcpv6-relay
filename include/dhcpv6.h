@@ -76,8 +76,8 @@
 #define DHCPv6_OPTION_NTP_SERVER                         56
 #define DHCPv6_OPTION_V6_ACCESS_DOMAIN                   57
 #define DHCPv6_OPTION_SIP_UA_CS_LIST                     58
-#define DHCPv6_OPT_BOOTFILE_URL                          59
-#define DHCPv6_OPT_BOOTFILE_PARAM                        60
+#define DHCPv6_OPTION_BOOTFILE_URL                       59
+#define DHCPv6_OPTION_BOOTFILE_PARAM                     60
 #define DHCPv6_OPTION_CLIENT_ARCH_TYPE                   61
 #define DHCPv6_OPTION_NII                                62
 #define DHCPv6_OPTION_GEOLOCATION                        63
@@ -120,7 +120,7 @@
 #define DHCPv6_OPTION_LQ_BASE_TIME                      100
 #define DHCPv6_OPTION_LQ_START_TIME                     101
 #define DHCPv6_OPTION_LQ_END_TIME                       102
-#define DHCPv6_DHCP_CAPTIVE_PORTAL                      103
+#define DHCPv6_OPTION_CAPTIVE_PORTAL                    103
 #define DHCPv6_OPTION_MPL_PARAMETERS                    104
 #define DHCPv6_OPTION_ANI_ATT                           105
 #define DHCPv6_OPTION_ANI_NETWORK_NAME                  106
