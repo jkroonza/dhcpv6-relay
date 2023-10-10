@@ -98,6 +98,10 @@ int usage(const char* progname, FILE* o, int r)
 	fprintf(o, "USAGE: %s [options] -- interface ...\n"
 			"  --upstream|-u ipv6addr\n"
 			"    IPv6 address to which to relay, currently no port specification is possible.\n"
+			"    Parsing is VERY rudementary, if there are colons in the name/IP (IPv6 ...), then if you\n"
+			"    don't want to specify a port, just append a trailing :, eg, instead of ::1 use ::1:\n"
+			"    this way the last colon is used as the host:port separator, but due to being an empty\n"
+			"    string will be defaulted to dhcpv6-server.\n"
 			"  --help|-h\n"
 			"    This help text, and exit.\n", progname);
 	return r;
@@ -370,8 +374,52 @@ int main(int argc, char ** argv)
 			break;
 		case 'h':
 			return usage(*argv, stdout, 0);
+		case 'u':
+			{
+				char *host = optarg;
+				char *service = strrchr(host, ':');
+				if (service) {
+					*service++ = 0;
+					if (!*service)
+						service = NULL;
+				}
+				struct addrinfo hints = {
+					.ai_flags = 0,
+					.ai_family = AF_INET6,
+					.ai_socktype = SOCK_DGRAM,
+					.ai_protocol = 0,
+				};
+				struct addrinfo *res = NULL;
+				int r = getaddrinfo(host, service, &hints, &res);
+				if (r) {
+					fprintf(stderr, "Error parsing upstream relay address: %s\n", gai_strerror(r));
+					return 1;
+				}
+
+				if (res->ai_addrlen != sizeof(upstream.remote)) {
+					fprintf(stderr, "Resulting address from upstream lookup resulted in incorrectly sized sockaddr structure.\n");
+					return 1;
+				}
+
+				memcpy(&upstream.remote, res->ai_addr, res->ai_addrlen);
+
+				freeaddrinfo(res);
+
+				if (service)
+					*--service = ':';
+				else
+					upstream.remote.sin6_port = serv_server.s_port;
+
+				upstream.remotename = optarg;
+			}
+			break;
 		default:
 		}
+	}
+
+	if (!upstream.remotename) {
+		fprintf(stderr, "Upstream DHCP server address is required.\n");
+		return usage(*argv, stderr, 1);
 	}
 
 	epollfd = epoll_create1(EPOLL_CLOEXEC);
@@ -397,6 +445,9 @@ int main(int argc, char ** argv)
 
 	if (bind(upstream.upstream_fd, (struct sockaddr*)&sockad, socklen) < 0)
 		perror("Error binding upstream socket to port, using ephemeral");
+
+	if (connect(upstream.upstream_fd, (struct sockaddr*)&upstream.remote, sizeof(upstream.remote)) < 0)
+		perror("Error narrowing client socket");
 
 	r = getifaddrs(&ifap_);
 	if (r < 0) {
