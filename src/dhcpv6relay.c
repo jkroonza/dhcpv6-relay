@@ -79,6 +79,9 @@ bool in_null_term_array(const char* needle, char ** haystack)
 	return false;
 }
 
+static
+struct servent serv_server, serv_client;
+
 /* signal handlers */
 static volatile bool running = true;
 
@@ -136,11 +139,23 @@ struct iface {
 static struct iface *iface_head = NULL;
 
 static
-struct iface *iface_get(const char* name)
+struct iface *iface_get_by_name(const char* name)
 {
 	struct iface *t = iface_head;
 	while (t && strcmp(name, t->iface_name) != 0)
 		t = t->next;
+
+	return t;
+}
+
+static
+struct iface *iface_get_by_linkid(uint32_t linkid)
+{
+	struct iface *t = iface_head;
+	while (t && t->linkid != linkid) {
+		printf("Testing iface with linkid=%u\n", t->linkid);
+		t = t->next;
+	}
 
 	return t;
 }
@@ -285,6 +300,8 @@ struct iface* iface_create(const char* name)
 		free(t);
 		return NULL;
 	}
+	t->next = iface_head;
+	iface_head = t;
 
 	return t;
 }
@@ -300,7 +317,7 @@ void iface_free(int epollfd, struct iface* iface)
 static
 struct iface *iface_bind(int epollfd, const char* name, const struct sockaddr_in6 *ll)
 {
-	struct iface* iface = iface_get(name);
+	struct iface* iface = iface_get_by_name(name);
 	if (iface)
 		iface_unbind(epollfd, iface);
 	else if (!(iface = iface_create(name)))
@@ -322,8 +339,8 @@ event_struct(upstream, char* remotename; struct sockaddr_in6 remote;);
 static
 void upstream_handler(int /* epollfd */, struct upstream_event* ev)
 {
-	struct dhcpv6_packet packet;
-	struct sockaddr_in6 src6;
+	struct dhcpv6_packet packet, relay;
+	struct sockaddr_in6 src6, dst6;
 	socklen_t srclen = sizeof(src6);
 
 	packet.pkt_size = recvfrom(ev->upstream_fd, packet.raw, sizeof(packet.raw), 0,
@@ -336,10 +353,42 @@ void upstream_handler(int /* epollfd */, struct upstream_event* ev)
 
 	dhcpv6_dump_packet(stdout, &packet, &src6, DHCPv6_DIRECTION_RECEIVE, "upstream");
 
-	if (!dhcpv6_packet_valid(&packet) || packet.msg_type != htons(DHCPv6_MSGTYPE_RELAY_REPL))
+	if (!dhcpv6_packet_valid(&packet) || packet.msg_type != DHCPv6_MSGTYPE_RELAY_REPL) {
+		fprintf(stderr, "Discarding non-relay-repl or invalid packet on upstream socket.\n");
 		return;
+	}
 
-	printf("Intend to relay from upstream to client (or another relay)\n");
+	const struct dhcpv6_option* opt = dhcpv6_packet_get_option(&packet, DHCPv6_OPTION_INTERFACE_ID);
+	if (!opt || opt->len != htons(sizeof(uint32_t))) {
+		fprintf(stderr, "Discarding relay-repl frame without interface-id option.\n");
+		return;
+	}
+
+	struct iface* iface = iface_get_by_linkid(*(uint32_t*)opt->payload);
+	if (!iface) {
+		fprintf(stderr, "Error locating interface with linkid=%u, discarding relay-repl frame.\n", *(uint32_t*)opt->payload);
+		return;
+	}
+
+	opt = dhcpv6_packet_get_option(&packet, DHCPv6_OPTION_RELAY_MSG);
+	if (!opt) {
+		fprintf(stderr, "Discarding relay-repo without relay-msg option.\n");
+		return;
+	}
+
+	memcpy(relay.raw, opt->payload, relay.pkt_size = ntohs(opt->len));
+
+	memset(&dst6, 0, sizeof(dst6));
+	dst6.sin6_family = AF_INET6;
+	dst6.sin6_scope_id = iface->linkid;
+	dst6.sin6_addr = packet.relay.peer_address;
+	dst6.sin6_port = dhcpv6_packet_is_relay(&relay) ? serv_server.s_port : serv_client.s_port;
+
+	dhcpv6_dump_packet(stdout, &relay, &dst6, DHCPv6_DIRECTION_TRANSMIT, iface->iface_name);
+
+	int r = sendto(iface->uni->if_uni_fd, relay.raw, relay.pkt_size, 0, (struct sockaddr*)&dst6, sizeof(dst6));
+	if (r < 0)
+		perror("error transmitting to downstream");
 }
 
 static
@@ -365,8 +414,7 @@ int main(int argc, char ** argv)
 	int c, epollfd, r;
 	struct sockaddr_in6 sockad;
 	socklen_t socklen;
-	struct servent serv_server;
-	char *buf_server;
+	char *buf_server, *buf_client;
 	char ip6addr[INET6_ADDRSTRLEN];
 	struct ifaddrs *ifap_;
 	struct sigaction sa;
@@ -374,6 +422,11 @@ int main(int argc, char ** argv)
 
 	if (getservbyname_wrap("dhcpv6-server", &serv_server, &buf_server)) {
 		perror("error getting service entry for dhcpv6-server");
+		return 1;
+	}
+
+	if (getservbyname_wrap("dhcpv6-client", &serv_client, &buf_client)) {
+		perror("error getting service entry for dhcpv6-client");
 		return 1;
 	}
 
