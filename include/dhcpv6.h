@@ -173,6 +173,7 @@ enum dhcpv6_option_type {
 	option_type_duid,
 	option_type_ipv6,
 	option_type_time,
+	option_type_embedded,
 };
 
 struct dhcpv6_option {
@@ -194,17 +195,17 @@ struct dhcpv6_packet {
 				struct {
 					unsigned trn_id:24;
 					struct dhcpv6_option optdata[0];
-				} norm;
+				} __attribute__((packed)) norm;
 				struct {
 					uint8_t hop_count;
 					struct in6_addr link_address;
 					struct in6_addr peer_address;
 					struct dhcpv6_option optdata[0];
-				} relay;
+				} __attribute__((packed)) relay;
 			};
-		};
+		} __attribute__((packed));
 	};
-} __attribute__((packed));
+};
 
 static
 inline bool dhcpv6_packet_is_relay(const struct dhcpv6_packet *pkt)

@@ -178,7 +178,7 @@ void iface_common_handler(int /* epollfd */, int rdfd, const char* ref, struct i
 	relay.pkt_size = dhcpv6_min_packet_size(&relay);
 
 	dhcpv6_append_option(&relay, DHCPv6_OPTION_INTERFACE_ID, &iface->linkid, sizeof(iface->linkid));
-//	dhcpv6_append_option(&relay, DHCPv6_OPTION_, packet->raw, packet->pkt_size);
+	dhcpv6_append_option(&relay, DHCPv6_OPTION_RELAY_MSG, packet.raw, packet.pkt_size);
 
 	relay_upstream(&relay);
 }
@@ -335,6 +335,8 @@ struct upstream_event upstream = {
 static
 void relay_upstream(const struct dhcpv6_packet *pkt)
 {
+	dhcpv6_dump_packet(stdout, pkt, &upstream.remote, DHCPv6_DIRECTION_TRANSMIT, "upstream unicast");
+
 	if (sendto(upstream.upstream_fd, pkt->raw, pkt->pkt_size, MSG_DONTWAIT,
 			(struct sockaddr*)&upstream.remote, sizeof(upstream.remote)) < 0)
 		perror("send to upstream");

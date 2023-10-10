@@ -65,7 +65,7 @@ struct dhcpv6_packet_option* internal_option_next(
 	}
 	/* at least the base dhcpv6_option data is valid, so make sure that payload
 	 * length doesn't overflow either */
-	if (opt_offset + sizeof(struct dhcpv6_option) + opt->len > pkt->pkt_size) {
+	if (opt_offset + sizeof(struct dhcpv6_option) + ntohs(opt->len) > pkt->pkt_size) {
 		errno = EOVERFLOW;
 		goto errout;
 	}
@@ -91,7 +91,7 @@ struct dhcpv6_packet_option* dhcpv6_packet_option_head(const struct dhcpv6_packe
 struct dhcpv6_packet_option* dhcpv6_packet_option_next(struct dhcpv6_packet_option* opt)
 {
 	return internal_option_next(opt, opt->src_packet,
-			(const struct dhcpv6_option*)&opt->detail->payload[opt->detail->len]);
+			(const struct dhcpv6_option*)&opt->detail->payload[ntohs(opt->detail->len)]);
 }
 
 static
@@ -204,6 +204,23 @@ char* dhcpv6_option_request_string(const struct dhcpv6_option* option)
 }
 
 static
+char* dhcpv6_option_opaque_string(const struct dhcpv6_option* option)
+{
+	int slen = ntohs(option->len);
+	char *res = malloc(slen * 2 + (slen - 1) / 4 + 1);
+	if (!res)
+		return NULL;
+	char *p = res;
+	for (int i = 0; i < slen; ++i) {
+		if (i && (i % 4 == 0))
+			*p++ = '-';
+		sprintf(p, "%02X", option->payload[i]);
+		p += 2;
+	}
+	return res;
+}
+
+static
 char* dhcpv6_time_string(const struct dhcpv6_option* option)
 {
 	uint16_t optlen = ntohs(option->len);
@@ -236,12 +253,21 @@ static const struct dhcpv6_option_meta option_metas[] = {
 		.opt_type = option_type_time,
 		.interp_to_string = dhcpv6_time_string,
 	},
+	[ DHCPv6_OPTION_RELAY_MSG ] = {
+		.opt_string = "relay-message",
+		.opt_type = option_type_embedded,
+	},
 	[ DHCPv6_OPTION_RAPID_COMMIT ] = {
 		.opt_string = "rapid-commit",
 	},
 	[ DHCPv6_OPTION_VENDOR_OPTS ] = {
 		.opt_string = "vendor-opts",
 		.opt_type = option_type_unspec,
+	},
+	[ DHCPv6_OPTION_INTERFACE_ID ] = {
+		.opt_string = "interface-id",
+		.opt_type = option_type_opaque,
+		.interp_to_string = dhcpv6_option_opaque_string,
 	},
 	[ DHCPv6_OPTION_DNS_SERVERS ] = {
 		.opt_string = "dns-servers",
@@ -273,34 +299,37 @@ const char* dhcpv6_validate_packet(const struct dhcpv6_packet* packet)
 
 bool _dhcpv6_packet_valid(const struct dhcpv6_packet *pkt)
 {
-	return !!dhcpv6_validate_packet(pkt);
+	return !dhcpv6_validate_packet(pkt);
 }
 
 static
 void dhcpv6_dump_packet_internal(FILE* fp, int d, const struct dhcpv6_packet* packet)
 {
-#define oline(fmt, ...) fprintf(fp, "%*s" fmt, d*2, "", ## __VA_ARGS__)
-	oline("msg-type: %s(%d)\n", dhcpv6_type2string(packet->msg_type), packet->msg_type);
+#define oline(fmt, ...) fprintf(fp, "%*s" fmt "\n", d*2, "", ## __VA_ARGS__)
+	oline("msg-type: %s(%d)", dhcpv6_type2string(packet->msg_type), packet->msg_type);
 
 	if (dhcpv6_packet_is_relay(packet)) {
-		oline("ERROR: Don't know how to output base data for relay packet yet\n");
+		char ip6str[INET6_ADDRSTRLEN];
+		oline("hop-count: %d", packet->relay.hop_count);
+		oline("link-address: %s", inet_ntop(AF_INET6, &packet->relay.link_address, ip6str, sizeof(ip6str)));
+		oline("peer-address: %s", inet_ntop(AF_INET6, &packet->relay.peer_address, ip6str, sizeof(ip6str)));
 	} else {
-		oline("trn-id: 0x%06X\n", ntohl(packet->norm.trn_id) >> 8);
+		oline("trn-id: 0x%06X", ntohl(packet->norm.trn_id) >> 8);
 	}
 
 	DHCPv6_FOREACH_PACKET_OPTION(packet, opt) {
 		char *interp = (opt->meta && opt->meta->interp_to_string)
 			?  opt->meta->interp_to_string(opt->detail) : NULL;
 
-		oline("option: %u/%s (len=%u)%s%s\n", ntohs(opt->detail->opcode),
+		oline("option: %u/%s (len=%u)%s%s", ntohs(opt->detail->opcode),
 				opt->meta ? opt->meta->opt_string : "unknown",
 				ntohs(opt->detail->len), interp ? ": " : "", interp ?: "");
 
 		free(interp);
 
-		if (opt->detail->opcode == DHCPv6_OPTION_RELAY_MSG) {
+		if (opt->detail->opcode == htons(DHCPv6_OPTION_RELAY_MSG)) {
 			struct dhcpv6_packet p;
-			p.pkt_size = opt->detail->len;
+			p.pkt_size = ntohs(opt->detail->len);
 			memcpy(&p.raw, opt->detail->payload, opt->detail->len);
 
 			const char* embedded_invalid = dhcpv6_validate_packet(&p);
@@ -335,7 +364,7 @@ void dhcpv6_dump_packet(FILE* fp, const struct dhcpv6_packet* packet, const stru
 	if (invalid)
 		fprintf(fp, "Packet is invalid: %s\n", invalid);
 
-	if (packet->pkt_size < 4)
+	if (packet->pkt_size < dhcpv6_min_packet_size(packet))
 		return;
 
 	dhcpv6_dump_packet_internal(fp, 1, packet);
@@ -352,8 +381,8 @@ int dhcpv6_append_option(struct dhcpv6_packet* pkt, uint16_t opcode, void* paylo
 	struct dhcpv6_option *ot = (struct dhcpv6_option*)&pkt->raw[pkt->pkt_size];
 	pkt->pkt_size += payloadlen + sizeof(struct dhcpv6_option);
 
-	ot->opcode = opcode;
-	ot->len = payloadlen;
+	ot->opcode = ntohs(opcode);
+	ot->len = ntohs(payloadlen);
 	memcpy(ot->payload, payload, payloadlen);
 
 	return 0;
