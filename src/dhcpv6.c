@@ -246,47 +246,38 @@ char* dhcpv6_time_string(const struct dhcpv6_option* option)
 static const struct dhcpv6_option_meta option_metas[] = {
 	[ DHCPv6_OPTION_CLIENTID ] = {
 		.opt_string = "clientid",
-		.opt_type = option_type_duid,
 		.interp_to_string = dhcpv6_duid_string,
 	},
 	[ DHCPv6_OPTION_SERVERID ] = {
 		.opt_string = "serverid",
-		.opt_type = option_type_duid,
 		.interp_to_string = dhcpv6_duid_string,
 	},
 	[ DHCPv6_OPTION_ORO ] = {
 		.opt_string = "option-request",
-		.opt_type = option_type_unspec,
 		.interp_to_string = dhcpv6_option_request_string,
 	},
 	[ DHCPv6_OPTION_ELAPSED_TIME ] = {
 		.opt_string = "elapsed-time",
-		.opt_type = option_type_time,
 		.interp_to_string = dhcpv6_time_string,
 	},
 	[ DHCPv6_OPTION_RELAY_MSG ] = {
 		.opt_string = "relay-message",
-		.opt_type = option_type_embedded,
 	},
 	[ DHCPv6_OPTION_RAPID_COMMIT ] = {
 		.opt_string = "rapid-commit",
 	},
 	[ DHCPv6_OPTION_VENDOR_OPTS ] = {
 		.opt_string = "vendor-opts",
-		.opt_type = option_type_unspec,
 	},
 	[ DHCPv6_OPTION_INTERFACE_ID ] = {
 		.opt_string = "interface-id",
-		.opt_type = option_type_opaque,
 		.interp_to_string = dhcpv6_option_opaque_string,
 	},
 	[ DHCPv6_OPTION_DNS_SERVERS ] = {
 		.opt_string = "dns-servers",
-		.opt_type = option_type_ipv6,
 	},
 	[ DHCPv6_OPTION_IA_PD ] = {
 		.opt_string = "ia-pd",
-		.opt_type = option_type_unspec,
 	},
 };
 

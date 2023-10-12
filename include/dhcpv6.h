@@ -167,15 +167,6 @@
 #define DHCPv6_OPTION_FORWARD_DIST_MANAGER              146
 #define DHCPv6_OPTION_REVERSE_DIST_MANAGER              147
 
-enum dhcpv6_option_type {
-	option_type_unspec = -1,
-	option_type_opaque = 0,
-	option_type_duid,
-	option_type_ipv6,
-	option_type_time,
-	option_type_embedded,
-};
-
 struct dhcpv6_option {
 	uint16_t opcode;
 	uint16_t len;
@@ -244,7 +235,6 @@ inline bool dhcpv6_packet_valid(const struct dhcpv6_packet *pkt)
 
 struct dhcpv6_option_meta {
 	const char* opt_string;
-	enum dhcpv6_option_type opt_type;
 	char* (*interp_to_string)(const struct dhcpv6_option*); /* need to free() result */
 	bool (*validate)(const struct dhcpv6_option*); /* true it's fine, false it's not */
 };
