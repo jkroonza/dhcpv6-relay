@@ -45,53 +45,64 @@ const char* dhcpv6_type2string(int msg_type)
 }
 
 static
-struct dhcpv6_packet_option* internal_option_next(
-		struct dhcpv6_packet_option* res,
-		const struct dhcpv6_packet* pkt,
-		const struct dhcpv6_option* opt)
+const struct dhcpv6_option* internal_option_buffer_next(const void* base, size_t buflen, const struct dhcpv6_option *last)
 {
 	errno = 0; /* ability to distinguish between end of headers and errors */
+
+	const struct dhcpv6_option *next;
+	if (!last) {
+		next = (const struct dhcpv6_option*)base;
+	} else {
+		next = (const struct dhcpv6_option*)((const char*)last + ntohs(last->len) + sizeof(struct dhcpv6_option));
+		buflen -= (void*)next - base;
+	}
+
+	if (buflen < sizeof(struct dhcpv6_option) || buflen < sizeof(struct dhcpv6_option) + ntohs(next->len)) {
+		errno = EOVERFLOW;
+		return NULL;
+	}
+
+	return next;
+}
+
+static
+struct dhcpv6_packet_option* internal_option_next(
+		struct dhcpv6_packet_option* res,
+		const struct dhcpv6_packet* pkt)
+{
+	const void* optionbuffer = dhcpv6_packet_is_relay(pkt) ?
+		pkt->relay.optdata : pkt->norm.optdata;
+	size_t bufferlen = pkt->pkt_size - dhcpv6_min_packet_size(pkt);
+
 	if (!res) {
 		res = malloc(sizeof(*res));
 		if (!res)
 			return NULL;
 		res->src_packet = pkt;
+		res->detail = NULL;
 	}
 
-	size_t opt_offset = (void*)opt - (void*)&pkt->msg_type;
-	if (opt_offset + sizeof(struct dhcpv6_option) > pkt->pkt_size) {
-		errno = EOVERFLOW;
-		goto errout;
-	}
-	/* at least the base dhcpv6_option data is valid, so make sure that payload
-	 * length doesn't overflow either */
-	if (opt_offset + sizeof(struct dhcpv6_option) + ntohs(opt->len) > pkt->pkt_size) {
-		errno = EOVERFLOW;
-		goto errout;
+	res->detail = internal_option_buffer_next(optionbuffer, bufferlen, res->detail);
+
+	if (!res->detail) {
+		int terrno = errno;
+		free(res);
+		errno = terrno;
+		return NULL;
 	}
 
-	res->detail = opt;
-	res->meta = dhcpv6_option_meta(ntohs(opt->opcode));
-
+	res->meta = dhcpv6_option_meta(ntohs(res->detail->opcode));
 	return res;
-
-errout:
-	free(res);
-	return NULL;
 }
 
 struct dhcpv6_packet_option* dhcpv6_packet_option_head(const struct dhcpv6_packet* pkt)
 {
-	const struct dhcpv6_option* optdata = dhcpv6_packet_is_relay(pkt) ?
-		pkt->relay.optdata : pkt->norm.optdata;
-
-	return internal_option_next(NULL, pkt, optdata);
+	return internal_option_next(NULL, pkt);
 }
 
 struct dhcpv6_packet_option* dhcpv6_packet_option_next(struct dhcpv6_packet_option* opt)
 {
-	return internal_option_next(opt, opt->src_packet,
-			(const struct dhcpv6_option*)&opt->detail->payload[ntohs(opt->detail->len)]);
+	return internal_option_next(opt, opt->src_packet);
 }
 
 static
