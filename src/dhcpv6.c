@@ -295,7 +295,22 @@ char* dhcpv6_ia_pd(const struct dhcpv6_option* option)
 
 	asprintf(&res, "iaid=%u, t1=%u, t2=%u", ntohl(pd->iaid), ntohl(pd->t1), ntohl(pd->t2));
 
-	// TODO: parse the nested options ...
+	return res;
+}
+
+static
+char* dhcpv6_iaprefix(const struct dhcpv6_option* option)
+{
+	const struct dhcpv6_iaprefix *ipa = (const struct dhcpv6_iaprefix*)option->payload;
+	uint16_t optlen = ntohs(option->len);
+	if (optlen < sizeof(*ipa))
+		return strdup("option truncated");
+
+	char ip6str[INET6_ADDRSTRLEN];
+	char *res;
+
+	asprintf(&res, "%s/%d (pltime:%u, vltime:%u)", inet_ntop(AF_INET6, &ipa->prefix, ip6str, sizeof(ip6str)), ipa->prefix_length,
+			ntohl(ipa->pref_lifetime), ntohl(ipa->valid_lifetime));
 
 	return res;
 }
@@ -339,6 +354,12 @@ static const struct dhcpv6_option_meta option_metas[] = {
 		.interp_to_string = dhcpv6_ia_pd,
 		.embed = dhcpv6_embed_options,
 		.embed_offset = sizeof(struct dhcpv6_ia_pd),
+	},
+	[ DHCPv6_OPTION_IAPREFIX ] = {
+		.opt_string = "iaprefix",
+		.interp_to_string = dhcpv6_iaprefix,
+		.embed = dhcpv6_embed_options,
+		.embed_offset = sizeof(struct dhcpv6_iaprefix),
 	},
 };
 

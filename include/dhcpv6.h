@@ -287,6 +287,14 @@ struct dhcpv6_ia_pd {
 	char options[0];
 } __attribute__((packed));
 
+struct dhcpv6_iaprefix {
+	uint32_t pref_lifetime;
+	uint32_t valid_lifetime;
+	uint8_t prefix_length;
+	struct in6_addr prefix;
+	char options[0];
+} __attribute__((packed));
+
 const char* dhcpv6_type2string(int msg_type);
 const struct dhcpv6_option_meta* dhcpv6_option_meta(uint16_t option);
 
