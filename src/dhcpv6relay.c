@@ -381,7 +381,7 @@ void upstream_handler(int /* epollfd */, struct upstream_event* ev)
 
 	opt = dhcpv6_packet_get_option(&packet, DHCPv6_OPTION_RELAY_MSG);
 	if (!opt) {
-		fprintf(stderr, "Discarding relay-repo without relay-msg option.\n");
+		fprintf(stderr, "Discarding relay-repl without relay-msg option.\n");
 		return;
 	}
 
