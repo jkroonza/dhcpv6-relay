@@ -45,6 +45,13 @@ const char* dhcpv6_type2string(int msg_type)
 }
 
 static
+void dhcpv6_calc_packet_option_buffer(const struct dhcpv6_packet *pkt, const void **buffer, size_t *buflen)
+{
+	*buffer = dhcpv6_packet_is_relay(pkt) ? pkt->relay.optdata : pkt->norm.optdata;
+	*buflen = pkt->pkt_size - dhcpv6_min_packet_size(pkt);
+}
+
+static
 const struct dhcpv6_option* internal_option_buffer_next(const void* base, size_t buflen, const struct dhcpv6_option *last)
 {
 	errno = 0; /* ability to distinguish between end of headers and errors */
@@ -66,18 +73,46 @@ const struct dhcpv6_option* internal_option_buffer_next(const void* base, size_t
 }
 
 static
-struct dhcpv6_packet_option* internal_option_next(
+struct dhcpv6_packet_option* internal_buffer_option_next(
+		struct dhcpv6_packet_option* res,
+		const void* buffer, size_t buflen)
+{
+	if (!res) {
+		res = malloc(sizeof(*res));
+		if (!res)
+			return NULL;
+		res->buflen = buflen;
+		res->buffer = buffer;
+		res->detail = NULL;
+	}
+
+	res->detail = internal_option_buffer_next(res->buffer, res->buflen, res->detail);
+
+	if (!res->detail) {
+		int terrno = errno;
+		free(res);
+		errno = terrno;
+		return NULL;
+	}
+
+	res->meta = dhcpv6_option_meta(ntohs(res->detail->opcode));
+	return res;
+}
+
+static
+struct dhcpv6_packet_option* internal_packet_option_next(
 		struct dhcpv6_packet_option* res,
 		const struct dhcpv6_packet* pkt)
 {
-	const void* optionbuffer = dhcpv6_packet_is_relay(pkt) ?
-		pkt->relay.optdata : pkt->norm.optdata;
-	size_t bufferlen = pkt->pkt_size - dhcpv6_min_packet_size(pkt);
+	const void* optionbuffer;
+	size_t bufferlen;
+	dhcpv6_calc_packet_option_buffer(pkt, &optionbuffer, &bufferlen);
 
 	if (!res) {
 		res = malloc(sizeof(*res));
 		if (!res)
 			return NULL;
+		res->buflen = 0;
 		res->src_packet = pkt;
 		res->detail = NULL;
 	}
@@ -95,14 +130,19 @@ struct dhcpv6_packet_option* internal_option_next(
 	return res;
 }
 
+struct dhcpv6_packet_option* dhcpv6_buffer_option_head(const void* buffer, size_t buflen)
+{
+	return internal_buffer_option_next(NULL, buffer, buflen);
+}
+
 struct dhcpv6_packet_option* dhcpv6_packet_option_head(const struct dhcpv6_packet* pkt)
 {
-	return internal_option_next(NULL, pkt);
+	return internal_packet_option_next(NULL, pkt);
 }
 
 struct dhcpv6_packet_option* dhcpv6_packet_option_next(struct dhcpv6_packet_option* opt)
 {
-	return internal_option_next(opt, opt->src_packet);
+	return opt->buflen ? internal_buffer_option_next(opt, opt->buffer, opt->buflen) : internal_packet_option_next(opt, opt->src_packet);
 }
 
 static
@@ -243,6 +283,23 @@ char* dhcpv6_time_string(const struct dhcpv6_option* option)
 	return ret;
 }
 
+static
+char* dhcpv6_ia_pd(const struct dhcpv6_option* option)
+{
+	const struct dhcpv6_ia_pd *pd = (const struct dhcpv6_ia_pd*)option->payload;
+	uint16_t optlen = ntohs(option->len);
+	if (optlen < sizeof(*pd))
+		return strdup("option truncated");
+
+	char *res;
+
+	asprintf(&res, "iaid=%u, t1=%u, t2=%u", ntohl(pd->iaid), ntohl(pd->t1), ntohl(pd->t2));
+
+	// TODO: parse the nested options ...
+
+	return res;
+}
+
 static const struct dhcpv6_option_meta option_metas[] = {
 	[ DHCPv6_OPTION_CLIENTID ] = {
 		.opt_string = "clientid",
@@ -262,6 +319,7 @@ static const struct dhcpv6_option_meta option_metas[] = {
 	},
 	[ DHCPv6_OPTION_RELAY_MSG ] = {
 		.opt_string = "relay-message",
+		.embed = dhcpv6_embed_packet,
 	},
 	[ DHCPv6_OPTION_RAPID_COMMIT ] = {
 		.opt_string = "rapid-commit",
@@ -278,6 +336,9 @@ static const struct dhcpv6_option_meta option_metas[] = {
 	},
 	[ DHCPv6_OPTION_IA_PD ] = {
 		.opt_string = "ia-pd",
+		.interp_to_string = dhcpv6_ia_pd,
+		.embed = dhcpv6_embed_options,
+		.embed_offset = sizeof(struct dhcpv6_ia_pd),
 	},
 };
 
@@ -305,9 +366,52 @@ bool _dhcpv6_packet_valid(const struct dhcpv6_packet *pkt)
 }
 
 static
+void dhcpv6_dump_packet_internal(FILE* fp, int d, const struct dhcpv6_packet* packet);
+
+#define oline(fmt, ...) fprintf(fp, "%*s" fmt "\n", d*2, "", ## __VA_ARGS__)
+static
+void dhcpv6_dump_packet_options_internal(FILE* fp, int d, const void* buffer, size_t buflen)
+{
+	DHCPv6_FOREACH_BUFFER_OPTION(buffer, buflen, opt) {
+		char *interp = (opt->meta && opt->meta->interp_to_string)
+			?  opt->meta->interp_to_string(opt->detail) : NULL;
+
+		oline("option: %u/%s (len=%u)%s%s", ntohs(opt->detail->opcode),
+				opt->meta ? opt->meta->opt_string : "unknown",
+				ntohs(opt->detail->len), interp ? ": " : "", interp ?: "");
+
+		free(interp);
+
+		if (opt->meta) {
+			switch (opt->meta->embed) {
+			case dhcpv6_embed_none:
+				break;
+			case dhcpv6_embed_packet:
+				{
+					struct dhcpv6_packet p;
+					p.pkt_size = ntohs(opt->detail->len) - opt->meta->embed_offset;
+					memcpy(&p.raw, opt->detail->payload + opt->meta->embed_offset, p.pkt_size);
+
+					const char* embedded_invalid = dhcpv6_validate_packet(&p);
+					if (embedded_invalid)
+						oline("** embedded packet is invalid: %s\n", embedded_invalid);
+
+					dhcpv6_dump_packet_internal(fp, d+1, &p);
+				}
+				break;
+			case dhcpv6_embed_options:
+				dhcpv6_dump_packet_options_internal(fp, d+1, opt->detail->payload + opt->meta->embed_offset, ntohs(opt->detail->len) - opt->meta->embed_offset);
+				break;
+			default:
+				oline("** Unknown embed mechanism.");
+			}
+		}
+	}
+}
+
+static
 void dhcpv6_dump_packet_internal(FILE* fp, int d, const struct dhcpv6_packet* packet)
 {
-#define oline(fmt, ...) fprintf(fp, "%*s" fmt "\n", d*2, "", ## __VA_ARGS__)
 	oline("msg-type: %s(%d)", dhcpv6_type2string(packet->msg_type), packet->msg_type);
 
 	if (dhcpv6_packet_is_relay(packet)) {
@@ -319,30 +423,12 @@ void dhcpv6_dump_packet_internal(FILE* fp, int d, const struct dhcpv6_packet* pa
 		oline("trn-id: 0x%06X", ntohl(packet->norm.trn_id) >> 8);
 	}
 
-	DHCPv6_FOREACH_PACKET_OPTION(packet, opt) {
-		char *interp = (opt->meta && opt->meta->interp_to_string)
-			?  opt->meta->interp_to_string(opt->detail) : NULL;
-
-		oline("option: %u/%s (len=%u)%s%s", ntohs(opt->detail->opcode),
-				opt->meta ? opt->meta->opt_string : "unknown",
-				ntohs(opt->detail->len), interp ? ": " : "", interp ?: "");
-
-		free(interp);
-
-		if (opt->detail->opcode == htons(DHCPv6_OPTION_RELAY_MSG)) {
-			struct dhcpv6_packet p;
-			p.pkt_size = ntohs(opt->detail->len);
-			memcpy(&p.raw, opt->detail->payload, opt->detail->len);
-
-			const char* embedded_invalid = dhcpv6_validate_packet(&p);
-			if (embedded_invalid)
-				oline("** embedded packet is invalid: %s\n", embedded_invalid);
-
-			dhcpv6_dump_packet_internal(fp, d+1, &p);
-		}
-	}
-#undef oline
+	const void* optionbuffer;
+	size_t bufferlen;
+	dhcpv6_calc_packet_option_buffer(packet, &optionbuffer, &bufferlen);
+	dhcpv6_dump_packet_options_internal(fp, d, optionbuffer, bufferlen);
 }
+#undef oline
 
 void dhcpv6_dump_packet(FILE* fp, const struct dhcpv6_packet* packet, const struct sockaddr_in6* remote, int direction, const char* interface)
 {

@@ -233,14 +233,26 @@ inline bool dhcpv6_packet_valid(const struct dhcpv6_packet *pkt)
 	return _dhcpv6_packet_valid(pkt);
 }
 
+enum dhcpv6_embed_type {
+	dhcpv6_embed_none = 0,
+	dhcpv6_embed_packet,
+	dhcpv6_embed_options,
+};
+
 struct dhcpv6_option_meta {
 	const char* opt_string;
 	char* (*interp_to_string)(const struct dhcpv6_option*); /* need to free() result */
 	bool (*validate)(const struct dhcpv6_option*); /* true it's fine, false it's not */
+	enum dhcpv6_embed_type embed;
+	size_t embed_offset;
 };
 
 struct dhcpv6_packet_option {
-	const struct dhcpv6_packet* src_packet;
+	size_t buflen; /* if zero, use src_packet, else buffer */
+	union {
+		const struct dhcpv6_packet* src_packet;
+		const void* buffer;
+	};
 	const struct dhcpv6_option* detail;
 	const struct dhcpv6_option_meta* meta;
 };
@@ -268,6 +280,13 @@ struct dhcpv6_duid {
 	};
 } __attribute__((packed));
 
+struct dhcpv6_ia_pd {
+	uint32_t iaid;
+	uint32_t t1;
+	uint32_t t2;
+	char options[0];
+} __attribute__((packed));
+
 const char* dhcpv6_type2string(int msg_type);
 const struct dhcpv6_option_meta* dhcpv6_option_meta(uint16_t option);
 
@@ -276,10 +295,12 @@ int dhcpv6_append_option(struct dhcpv6_packet* pkt, uint16_t opcode, void* paylo
 
 const struct dhcpv6_option* dhcpv6_packet_get_option(const struct dhcpv6_packet* pkt, uint16_t opcode);
 
+struct dhcpv6_packet_option* dhcpv6_buffer_option_head(const void* buffer, size_t buflen);
 struct dhcpv6_packet_option* dhcpv6_packet_option_head(const struct dhcpv6_packet*);
 struct dhcpv6_packet_option* dhcpv6_packet_option_next(struct dhcpv6_packet_option*);
 
 #define DHCPv6_FOREACH_PACKET_OPTION(p, x) for (struct dhcpv6_packet_option* x = dhcpv6_packet_option_head(p); x; x = dhcpv6_packet_option_next(x))
+#define DHCPv6_FOREACH_BUFFER_OPTION(b, l, x) for (struct dhcpv6_packet_option* x = dhcpv6_buffer_option_head(b, l); x; x = dhcpv6_packet_option_next(x))
 
 #define DHCPv6_DIRECTION_RECEIVE	1
 #define DHCPv6_DIRECTION_TRANSMIT	2
