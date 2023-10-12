@@ -95,6 +95,7 @@ static
 struct option options[] = {
 	{ "bind",		required_argument,	NULL, 'b' },
 	{ "upstream",	required_argument,	NULL, 'u' },
+	{ "hlim",		required_argument,	NULL, 'l' },
 	{ "help",		no_argument,		NULL, 'h' },
 	{ NULL, 0, NULL, 0 }
 };
@@ -103,16 +104,20 @@ static
 int usage(const char* progname, FILE* o, int r)
 {
 	fprintf(o, "USAGE: %s [options] -- interface ...\n"
+			"  --bind|-b ipv6addr\n"
+			"    In some cases you may want to bind the upstream socket to a specific local address.\n"
+			"    Normally we will bind to localhost:dhcpv6-server and then 'narrow' to a specific local\n"
+			"    address based on upstream.  If upstream is on the local host that could cause issues.\n"
+			"  --hlim|-l {1..255}\n"
+			"    Explicitly set hop-limit in replies to clients.  As a rule you should NOT use this and\n"
+			"    simply rely on the kernel setting this sanely.  This could potentially break relay chans.\n"
+			"    Option is added because some client firewalls expect the hlim value to be 255 for some reason.\n"
 			"  --upstream|-u ipv6addr\n"
 			"    IPv6 address to which to relay, currently no port specification is possible.\n"
 			"    Parsing is VERY rudementary, if there are colons in the name/IP (IPv6 ...), then if you\n"
 			"    don't want to specify a port, just append a trailing :, eg, instead of ::1 use ::1:\n"
 			"    this way the last colon is used as the host:port separator, but due to being an empty\n"
 			"    string will be defaulted to dhcpv6-server.\n"
-			"  --bind|-b ipv6addr\n"
-			"    In some cases you may want to bind the upstream socket to a specific local address.\n"
-			"    Normally we will bind to localhost:dhcpv6-server and then 'narrow' to a specific local\n"
-			"    address based on upstream.  If upstream is on the local host that could cause issues.\n"
 			"  --help|-h\n"
 			"    This help text, and exit.\n", progname);
 	return r;
@@ -137,6 +142,7 @@ struct iface {
 };
 
 static struct iface *iface_head = NULL;
+static int iface_hlim = -1;
 
 static
 struct iface *iface_get_by_name(const char* name)
@@ -242,6 +248,9 @@ int _iface_bind(struct iface* iface, int epollfd, const struct sockaddr_in6 *ll)
 
 	if (bind(sock_linklocal, (const struct sockaddr*)ll, sizeof(*ll)) < 0)
 		goto errout;
+
+	if (0 < iface_hlim && setsockopt(sock_linklocal, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &iface_hlim, sizeof(iface_hlim)) < 0)
+		perror("error setting IPV6_UNICAST_HOPS on LL socket");
 
 	memset(&mreq, 0, sizeof(mreq));
 	if (inet_pton(AF_INET6, "ff02::1:2", &mreq.ipv6mr_multiaddr) < 0)
@@ -435,7 +444,7 @@ int main(int argc, char ** argv)
 	sockad.sin6_family = AF_INET6;
 	sockad.sin6_port = serv_server.s_port;
 
-	while ((c = getopt_long(argc, argv, "b:u:h", options, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "b:l:u:h", options, NULL)) != -1) {
 		switch (c) {
 		case 0:
 			break;
@@ -489,6 +498,18 @@ int main(int argc, char ** argv)
 				}
 
 				freeaddrinfo(res);
+			}
+			break;
+		case 'l':
+			{
+				char* ep = NULL;
+				int t = strtol(optarg, &ep, 0);
+				if (*optarg && !*ep && t >= 1 && t <= 255) {
+					iface_hlim = t;
+				} else {
+					fprintf(stderr, "--hlim argument must be an integer value from 1 to 255.\n");
+					return 1;
+				}
 			}
 			break;
 		default:
